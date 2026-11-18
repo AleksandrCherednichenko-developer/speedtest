@@ -1,114 +1,117 @@
 #!/usr/bin/env node
-// Замер скорости скачивания: N последовательных запросов к одному URL.
+// CLI: N последовательных запросов к одному URL и сводка по скорости скачивания.
 // Единицы: время — мс, объём — МБ (10^6 байт), скорость — Мбит/с (10^6 бит/с).
 
-const DEFAULT_COUNT = 10;
+import { measure, parseArgs, summarize, toMB, toMbps } from './lib.js';
 
-function printUsage() {
-  console.log('Использование: node index.js <url> [--count N]');
-  console.log('Пример:        node index.js https://proof.ovh.net/files/10Mb.dat');
+const USAGE = `Использование: node index.js <url> [опции]
+
+Опции:
+  --count N      число замеряемых запросов (по умолчанию 10)
+  --warmup N     сколько прогревочных запросов сделать до замера, они не учитываются (0)
+  --timeout MS   лимит на один запрос в миллисекундах (30000)
+  --json         вывести результат в JSON
+  -h, --help     эта справка
+
+Пример: node index.js https://proof.ovh.net/files/10Mb.dat`;
+
+const pad = (value, width) => String(value).padStart(width);
+
+// Прогресс пишем в stderr и только в терминал: он не мешает JSON и перенаправлению вывода.
+function createProgress(enabled) {
+  const out = process.stderr;
+  return {
+    update(label, bytes) {
+      if (enabled) out.write(`\r${label}  загружено ${toMB(bytes).toFixed(2)} МБ...`);
+    },
+    clear() {
+      if (enabled) out.write('\r\x1b[K');
+    },
+  };
 }
 
-function parseArgs(argv) {
-  const args = argv.slice(2);
-  let count = DEFAULT_COUNT;
-  let url;
-
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--count') {
-      count = Number(args[++i]);
-    } else if (args[i] === '-h' || args[i] === '--help') {
-      return { help: true };
-    } else {
-      url = args[i];
-    }
-  }
-
-  return { url, count };
+function printSummary(summary, count) {
+  const { timeMs: t, speedMbps: s } = summary;
+  console.log('\nИтого');
+  console.log(`  Успешных запросов:     ${summary.requests} из ${count}`);
+  console.log(`  Скачано всего:         ${toMB(summary.totalBytes).toFixed(2)} МБ`);
+  console.log(`  Среднее время запроса: ${t.avg.toFixed(1)} мс`);
+  console.log(`  Время (медиана/мин/макс): ${t.median.toFixed(1)} / ${t.min.toFixed(1)} / ${t.max.toFixed(1)} мс`);
+  console.log(`  Скорость (медиана/мин/макс): ${s.median.toFixed(2)} / ${s.min.toFixed(2)} / ${s.max.toFixed(2)} Мбит/с`);
+  console.log(`  Скорость скачивания:   ${s.overall.toFixed(2)} Мбит/с`);
 }
-
-// Один запрос: время от отправки до получения последнего байта тела.
-async function measure(url) {
-  const start = performance.now();
-  const res = await fetch(url, { headers: { 'Cache-Control': 'no-cache' } });
-
-  if (!res.ok) {
-    // Тело всё равно нужно освободить, чтобы соединение не висело.
-    await res.body?.cancel();
-    throw new Error(`HTTP ${res.status} ${res.statusText}`);
-  }
-
-  // Считаем реально полученные байты, а не Content-Length.
-  let bytes = 0;
-  for await (const chunk of res.body) {
-    bytes += chunk.length;
-  }
-
-  return { ms: performance.now() - start, bytes };
-}
-
-const toMB = (bytes) => bytes / 1e6;
-const toMbps = (bytes, ms) => (bytes * 8) / (ms / 1000) / 1e6;
 
 async function main() {
-  const { url, count, help } = parseArgs(process.argv);
+  const parsed = parseArgs(process.argv.slice(2));
 
-  if (help) {
-    printUsage();
-    return;
+  if (parsed.help) {
+    console.log(USAGE);
+    return 0;
+  }
+  if (parsed.error) {
+    console.error(`${parsed.error}\n\n${USAGE}`);
+    return 1;
   }
 
-  if (!url) {
-    printUsage();
-    process.exit(1);
-  }
+  const { url, count, warmup, timeout, json } = parsed.options;
+  const log = json ? () => {} : console.log;
+  const progress = createProgress(!json && process.stderr.isTTY);
 
-  try {
-    const { protocol } = new URL(url);
-    if (protocol !== 'http:' && protocol !== 'https:') throw new Error();
-  } catch {
-    console.error(`Некорректный адрес: ${url} (нужен http:// или https://)`);
-    process.exit(1);
-  }
+  // Ctrl+C: первый раз прерываем текущий запрос и печатаем частичный итог,
+  // второй раз выходим сразу.
+  const controller = new AbortController();
+  process.on('SIGINT', () => {
+    if (controller.signal.aborted) process.exit(130);
+    controller.abort();
+  });
 
-  if (!Number.isInteger(count) || count < 1) {
-    console.error('--count должен быть целым числом больше 0');
-    process.exit(1);
-  }
+  log(`URL: ${url}`);
+  log(`Запросов: ${count}${warmup ? ` (+${warmup} прогревочных)` : ''}, таймаут: ${timeout} мс\n`);
 
-  console.log(`URL: ${url}`);
-  console.log(`Запросов: ${count}\n`);
-
-  let totalMs = 0;
-  let totalBytes = 0;
-  let ok = 0;
+  const results = [];
+  const requests = [];
 
   // Строго последовательно: следующий запрос стартует после полного ответа.
-  for (let i = 1; i <= count; i++) {
+  for (let i = 1 - warmup; i <= count && !controller.signal.aborted; i++) {
+    const isWarmup = i < 1;
+    const label = isWarmup ? 'прогрев' : `#${pad(i, 2)}`;
+
     try {
-      const { ms, bytes } = await measure(url);
-      totalMs += ms;
-      totalBytes += bytes;
-      ok++;
-      console.log(
-        `#${String(i).padStart(2)}  ${ms.toFixed(1).padStart(9)} мс  ` +
-          `${toMB(bytes).toFixed(2).padStart(8)} МБ  ${toMbps(bytes, ms).toFixed(2).padStart(8)} Мбит/с`,
-      );
+      const r = await measure(url, {
+        timeout,
+        signal: controller.signal,
+        onProgress: (bytes) => progress.update(label, bytes),
+      });
+      progress.clear();
+      const speed = toMbps(r.bytes, r.ms);
+      log(`${label.padEnd(7)} ${pad(r.ms.toFixed(1), 9)} мс  ${pad(toMB(r.bytes).toFixed(2), 8)} МБ  ${pad(speed.toFixed(2), 8)} Мбит/с`);
+      if (!isWarmup) {
+        results.push(r);
+        requests.push({ ms: r.ms, bytes: r.bytes, mbps: speed });
+      }
     } catch (err) {
-      console.log(`#${String(i).padStart(2)}  ошибка: ${err.cause?.message ?? err.message}`);
+      progress.clear();
+      log(`${label.padEnd(7)} ошибка: ${err.message}`);
+      if (!isWarmup && !err.aborted) requests.push({ error: err.message });
     }
   }
 
-  if (ok === 0) {
-    console.error('\nНи один запрос не завершился успешно.');
-    process.exit(1);
+  const interrupted = controller.signal.aborted;
+  if (interrupted) log('\nОстановлено по Ctrl+C, итог по завершённым запросам.');
+
+  const summary = summarize(results);
+
+  if (json) {
+    console.log(JSON.stringify({ url, count, warmup, timeout, interrupted, requests, summary }, null, 2));
+  } else if (summary) {
+    printSummary(summary, count);
   }
 
-  console.log('\nИтого');
-  console.log(`  Успешных запросов:     ${ok} из ${count}`);
-  console.log(`  Среднее время запроса: ${(totalMs / ok).toFixed(1)} мс`);
-  console.log(`  Скачано всего:         ${toMB(totalBytes).toFixed(2)} МБ`);
-  console.log(`  Скорость скачивания:   ${toMbps(totalBytes, totalMs).toFixed(2)} Мбит/с`);
+  if (!summary) {
+    if (!json) console.error('\nНи один запрос не завершился успешно.');
+    return 1;
+  }
+  return interrupted ? 130 : 0;
 }
 
-main();
+process.exitCode = await main();
